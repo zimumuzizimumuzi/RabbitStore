@@ -6,7 +6,7 @@
 
 ## 1. 元数据模型设计 (Metadata Model)
 
-从逻辑视角看，MetaServer 维护的元数据主要分为两层：**File 元数据** 和 **Chunk 元数据**。
+从逻辑视角看，MetaServer 维护的元数据主要分为三层：**目录解析（Namespace）**、**File 元数据** 和 **Chunk 元数据**。
 
 ### 1.1 核心数据结构 (C++ 描述)
 
@@ -15,6 +15,28 @@
 #include <vector>
 #include <unordered_map>
 
+// ==================== 第一层：目录解析（Namespace） ====================
+// 负责将用户可见的路径解析为内部 file_id。
+// 目录树与文件内容解耦，rename 只需修改目录项，不影响 FileNode。
+
+// 目录项类型
+enum class EntryType {
+    FILE = 0,
+    DIRECTORY = 1
+};
+
+// 目录项 (持久化到 RocksDB CF_NAMESPACE)
+struct DirEntry {
+    std::string name;                // 当前层级的文件/目录名
+    EntryType type;                  // 文件 or 目录
+    uint64_t file_id;               // type==FILE 时指向 FileNode；type==DIRECTORY 时为目录自身的 inode_id
+    uint64_t parent_id;             // 父目录的 inode_id（根目录为 0）
+};
+
+// ==================== 第二层：File 元数据（FileNode） ====================
+// 通过 file_id 索引，存储文件的实际属性和 Chunk 列表。
+// 与路径无关，支持 O(1) rename 和 hardlink 等语义。
+
 // 文件状态
 enum class FileStatus {
     RW = 0,       // 文件处于打开并可追加写入的状态
@@ -22,9 +44,9 @@ enum class FileStatus {
     DELETED = 2   // 文件已被逻辑删除，等待后台 GC 物理回收
 };
 
-// File 元数据 (持久化到 RocksDB)
-struct FileMeta {
-    std::string file_path;           // 文件的唯一标识或路径
+// FileNode (持久化到 RocksDB CF_FILE)
+struct FileNode {
+    uint64_t file_id;                // 全局唯一的文件标识符
     uint64_t file_size;              // 文件的逻辑总大小
     FileStatus status;               // 文件的当前状态
     std::vector<uint64_t> chunk_list;// 文件所包含的 Chunk ID 列表（有序）
@@ -224,17 +246,35 @@ MetaServer 使用 RocksDB 的 Column Family 对不同类型的元数据进行物
 
 | Column Family | 用途 | Key 编码 | Value |
 |---|---|---|---|
-| `CF_FILE` | 文件元数据 | `file_path`（全路径字符串） | `FileMeta` 的 Protobuf 序列化 |
+| `CF_NAMESPACE` | 目录解析（路径→file_id） | `parent_id`（8 字节 Big-Endian）+ `\0` + `name` | `DirEntry` 的 Protobuf 序列化 |
+| `CF_FILE` | FileNode 元数据（file_id→文件属性） | `file_id`（8 字节 Big-Endian） | `FileNode` 的 Protobuf 序列化 |
 | `CF_CHUNK` | Chunk 元数据 | `chunk_id`（8 字节 Big-Endian） | `ChunkMeta` 的 Protobuf 序列化 |
-| `CF_FILE_CHUNK` | 文件→Chunk 映射 | `file_path` + `\0` + `chunk_index`（4 字节 Big-Endian） | `chunk_id`（8 字节） |
+| `CF_FILE_CHUNK` | 文件→Chunk 映射 | `file_id`（8 字节 Big-Endian）+ `\0` + `chunk_index`（4 字节 Big-Endian） | `chunk_id`（8 字节） |
 | `CF_LOCK` | Fencing 锁 | `lock_key`（由 Chunk 或文件标识） | `FencingToken` 的 Protobuf 序列化 |
 | `CF_SYSTEM` | 系统元数据 | `"applied_index"` 等固定字符串 | 各类系统状态 |
 
 #### 3.2.2 Key 编码细节
 
-**Chunk Key** 采用 Big-Endian 编码的原因：RocksDB 默认使用字节序比较，Big-Endian 保证数字大小关系与字节序一致，从而支持高效的范围扫描（如获取某区间内的所有 Chunk）。
+所有整数 Key 均采用 Big-Endian 编码：RocksDB 默认使用字节序比较，Big-Endian 保证数字大小关系与字节序一致，从而支持高效的范围扫描。
 
 ```cpp
+// Namespace Key 编码：parent_id + '\0' + name
+// 支持按 parent_id 前缀扫描列出目录下所有子项
+std::string EncodeNamespaceKey(uint64_t parent_id, const std::string& name) {
+    std::string key(8, '\0');
+    EncodeFixed64BigEndian(&key[0], parent_id);
+    key.push_back('\0');
+    key.append(name);
+    return key;
+}
+
+// File Key 编码
+std::string EncodeFileKey(uint64_t file_id) {
+    std::string key(8, '\0');
+    EncodeFixed64BigEndian(&key[0], file_id);
+    return key;
+}
+
 // Chunk Key 编码
 std::string EncodeChunkKey(uint64_t chunk_id) {
     std::string key(8, '\0');
@@ -242,11 +282,11 @@ std::string EncodeChunkKey(uint64_t chunk_id) {
     return key;
 }
 
-// File-Chunk 映射 Key 编码：file_path + '\0' + chunk_index
-// 支持按 file_path 前缀扫描获取文件的所有 Chunk（有序）
-std::string EncodeFileChunkKey(const std::string& file_path, uint32_t chunk_index) {
-    std::string key;
-    key.append(file_path);
+// File-Chunk 映射 Key 编码：file_id + '\0' + chunk_index
+// 支持按 file_id 前缀扫描获取文件的所有 Chunk（有序）
+std::string EncodeFileChunkKey(uint64_t file_id, uint32_t chunk_index) {
+    std::string key(8, '\0');
+    EncodeFixed64BigEndian(&key[0], file_id);
     key.push_back('\0');
     char buf[4];
     EncodeFixed32BigEndian(buf, chunk_index);
