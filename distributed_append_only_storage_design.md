@@ -191,8 +191,7 @@ Chunk 与 Shard 的核心区别：
 - **Unhealthy → Sealed**（**唯一**从亚健康回到健康的路径）：修复完成后 **A = max_shards**（**L = 0**）。**修复前必须先对 Chunk 执行 Seal**；因此不允许 **Unhealthy → RW**。
 - **任意非 Deleted → Deleted**：MetaServer 删除/GC 指令。
 
-<details>
-<summary> 状态机图 </summary>
+**状态机图**（Mermaid）：
 
 ```mermaid
 stateDiagram-v2
@@ -211,12 +210,13 @@ stateDiagram-v2
   Deleted --> [*]
 ```
 
-</details>
-
 > **注意**：
-（1）上表为**逻辑 Chunk** 状态；各分片在 ChunkServer 上仍有本地状态（如读写中的追加偏移、分片级损坏标记）。MetaServer 根据心跳与校验结果聚合 **A**/**L** 后更新 Chunk 状态。
-（2）分片级「损坏」与逻辑 **DataLost** 不同：仅当 **A < min_shards** 时 Chunk 才进入 **DataLost**。
-（3）Mermaid 边标签中的 **min_shards** / **max_shards** 须代入该 Chunk 的实际冗余参数。
+>
+> （1）上表为**逻辑 Chunk** 状态；各分片在 ChunkServer 上仍有本地状态（如读写中的追加偏移、分片级损坏标记）。MetaServer 根据心跳与校验结果聚合 **A**/**L** 后更新 Chunk 状态。
+>
+> （2）分片级「损坏」与逻辑 **DataLost** 不同：仅当 **A < min_shards** 时 Chunk 才进入 **DataLost**。
+>
+> （3）Mermaid 边标签中的 **min_shards** / **max_shards** 须代入该 Chunk 的实际冗余参数。
 
 ### 3.4 Chunk 冗余编码
 
