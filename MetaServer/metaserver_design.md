@@ -137,10 +137,8 @@ message MetaOperation {
         OP_UPDATE_CHUNK_SIZE = 12;  // 更新 Chunk 的已确认写入长度
         OP_SET_CHUNK_STATUS  = 13;  // 修改 Chunk 状态（Unhealthy / DataLost / Deleted）
 
-        // --- 分布式锁 ---
-        OP_ACQUIRE_LOCK      = 20;  // 获取 Fencing 锁
-        OP_RELEASE_LOCK      = 21;  // 释放 Fencing 锁
-        OP_RENEW_LOCK        = 22;  // 续约 Fencing 锁
+        // --- 目录 Fencing ---
+        OP_ACQUIRE_DIR_FENCING = 20;  // 强制获取目录写入权（更新 ID 文件）
 
         // --- 集群管理 ---
         OP_REGISTER_CS       = 30;  // ChunkServer 注册
@@ -190,43 +188,48 @@ void MetaStateMachine::on_apply(braft::Iterator& iter) {
 }
 ```
 
-### 2.3 分布式 Fencing 锁
+### 2.3 目录级分布式 Fencing
 
-为了支持存算分离，MetaServer 提供带有 `IP:Port + Epoch` 的分布式锁，防止脑裂和僵尸进程。
+为了支持存算分离场景下的目录级单写者保证，MetaServer 在每个目录下维护一个 **ID 文件**，记录当前合法写入者的身份标识。ID 文件内容直接内联存储在目录的 inode 元数据中，通过 Raft 持久化。
 
 ```cpp
-struct FencingToken {
-    std::string client_addr; // 客户端的 IP:Port
-    uint64_t epoch;          // 单调递增的 epoch
+struct DirFencingID {
+    std::string client_addr;   // 当前所有者的 IP:Port
+    uint64_t version;          // 单调递增的版本号
 };
+```
 
-// 校验逻辑伪代码 (运行在 ChunkServer 侧)
-bool CheckFencingToken(const FencingToken& request_token, const FencingToken& current_token) {
-    if (request_token.client_addr != current_token.client_addr) {
-        return false; // 跨节点脑裂，拒绝
-    }
-    if (request_token.epoch < current_token.epoch) {
-        return false; // 同节点旧生命周期的僵尸包，拒绝
-    }
-    return true;
+`addr:version` 整体作为目录所有权标识（类似 session ID）。`version` 不具有独立的 fencing 语义，仅用于区分同一节点多次获取权限的不同会话。校验逻辑为**等值匹配**：
+
+```cpp
+bool ValidateDirFencing(const DirFencingID& request_id,
+                        const DirFencingID& current_id) {
+    return request_id.client_addr == current_id.client_addr
+        && request_id.version == current_id.version;
 }
 ```
 
-**Fencing 锁的典型使用场景**：
+**Fencing 的典型使用场景**：
 
 ```
-① Client A 向 MetaServer 申请锁（OP_ACQUIRE_LOCK）
-   → MetaServer 分配 FencingToken{addr="A:8001", epoch=5}
+① 调度系统将目录分配给 Client A
+   Client A 向 MetaServer 强制获取 ID（OP_ACQUIRE_DIR_FENCING）
+   → MetaServer 更新 ID 文件为 {addr="A:8001", version=5}
 
-② Client A 携带 Token 向 ChunkServer 写入数据
-   → ChunkServer 记录该 Chunk 的最新 Token
+② Client A 携带 addr:version 在目录下创建文件、分配 Chunk
+   → MetaServer 校验 addr:version 与 ID 文件一致，允许操作
 
-③ Client A 宕机重启，向 MetaServer 重新申请锁
-   → MetaServer 分配 FencingToken{addr="A:8001", epoch=6}
+③ Client A 崩溃，调度系统将目录调度给 Client B
+   Client B 强制获取 ID
+   → MetaServer 先 Seal 目录下所有 RW 文件，再更新 ID 为 {addr="B:8001", version=6}
 
-④ 旧 Client A（僵尸进程，epoch=5）的残留写入到达 ChunkServer
-   → ChunkServer 发现 epoch=5 < current_epoch=6，拒绝写入
+④ 旧 Client A（僵尸进程）尝试 CreateFile
+   → MetaServer 发现 addr:version 不匹配当前 ID，拒绝操作
+   旧 Client A 尝试 WriteShard 到已有 Chunk
+   → ChunkServer 发现 Chunk 已 Sealed，拒绝写入
 ```
+
+详细设计参见 [分布式 Fencing 设计文档](distributed_fencing_design.md)。
 
 ---
 
@@ -250,7 +253,6 @@ MetaServer 使用 RocksDB 的 Column Family 对不同类型的元数据进行物
 | `CF_FILE` | FileNode 元数据（file_id→文件属性） | `file_id`（8 字节 Big-Endian） | `FileNode` 的 Protobuf 序列化 |
 | `CF_CHUNK` | Chunk 元数据 | `chunk_id`（8 字节 Big-Endian） | `ChunkMeta` 的 Protobuf 序列化 |
 | `CF_FILE_CHUNK` | 文件→Chunk 映射 | `file_id`（8 字节 Big-Endian）+ `\0` + `chunk_index`（4 字节 Big-Endian） | `chunk_id`（8 字节） |
-| `CF_LOCK` | Fencing 锁 | `lock_key`（由 Chunk 或文件标识） | `FencingToken` 的 Protobuf 序列化 |
 | `CF_SYSTEM` | 系统元数据 | `"applied_index"` 等固定字符串 | 各类系统状态 |
 
 #### 3.2.2 Key 编码细节
@@ -675,7 +677,7 @@ Client                       MetaServer                  ChunkServer 1/2/3
 
 **触发条件**：
 
-- Client 持有的 Fencing 锁过期且未续约（检测到 Client 崩溃）
+- 目录写入权被新 Client 强制获取（Acquire 过程中触发 Seal）
 - Chunk 处于 RW 状态超过 `max_rw_duration`（默认 1 小时）且无活跃写入
 - Chunk 状态变为 Unhealthy 且需要修复（修复前必须先 Seal）
 
@@ -1178,9 +1180,7 @@ struct TopologyNode {
 | `SealChunk(chunk_id, size)` | 封存 Chunk | 是 |
 | `GetChunkInfo(chunk_id)` | 获取 Chunk 路由和状态 | 否 |
 | `BatchGetChunkInfo(chunk_ids[])` | 批量获取 Chunk 信息 | 否 |
-| `AcquireLock(key, client_addr)` | 获取 Fencing 锁 | 是 |
-| `RenewLock(key, token)` | 续约锁 | 是 |
-| `ReleaseLock(key, token)` | 释放锁 | 是 |
+| `AcquireDirFencing(dir, addr)` | 强制获取目录写入权（更新 ID 文件 + Seal 旧文件） | 是 |
 
 **读写分离**：纯读操作（GetChunkInfo、OpenFile 等）可以通过配置直接在 Leader 本地 RocksDB 上读取，不需要走 Raft 共识流程。写操作必须经过 Raft。
 
@@ -1276,7 +1276,7 @@ Leader 宕机:
 Raft 协议本身保证了不会出现双 Leader。但网络分区场景下的额外防护：
 
 - 旧 Leader 被分区后，新 Leader 当选，旧 Leader 的写入不会被多数派接受
-- Fencing 锁机制确保旧 Client 的写入被 ChunkServer 拒绝（epoch 检查）
+- 目录 ID 文件机制确保旧 Client 的元数据操作被 MetaServer 拒绝（addr:version 校验），Seal 确保旧 Chunk 不可写入
 - ChunkServer 只接受与 MetaServer 最新心跳中一致的操作
 
 ---
